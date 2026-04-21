@@ -2,14 +2,28 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
+
+func jsonUnmarshalOrEmpty(b []byte, v any) error {
+	if len(bytes.TrimSpace(b)) == 0 {
+		return nil
+	}
+	return json.Unmarshal(b, v)
+}
+
+func jsonEncode(w io.Writer, v any) error {
+	e := json.NewEncoder(w)
+	return e.Encode(v)
+}
 
 // findClaudeBin resolves the claude binary. Honors $CLAUDE_BIN, otherwise
 // uses `claude` from PATH.
@@ -29,15 +43,28 @@ func findClaudeBin() (string, error) {
 
 func cmdSpawn(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: camux spawn <session> [--name W] [--dir D] [--no-skip-perms] [--timeout 60s]")
+		return fmt.Errorf("usage: camux spawn <session> [flags] — see 'camux spawn -h'")
 	}
 	session := args[0]
 	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	winName := fs.String("name", "cc", "window name")
-	dir := fs.String("dir", "", "directory to launch Claude in (becomes its cwd)")
+	winName := fs.String("name", "cc", "window name (e.g. 'cc', 'planner')")
+	dir := fs.String("dir", "", "launch cwd (becomes Claude's working directory)")
 	noSkip := fs.Bool("no-skip-perms", false, "omit --dangerously-skip-permissions")
-	timeout := fs.Duration("timeout", 60*time.Second, "time to wait for Claude to become ready")
+	timeout := fs.Duration("timeout", 60*time.Second, "ready deadline")
+
+	// Passthrough flags mapped to `claude` CLI flags.
+	model := fs.String("model", "", "model alias or ID (claude --model)")
+	systemPrompt := fs.String("system-prompt", "", "full system prompt (claude --system-prompt)")
+	appendSystem := fs.String("append-system", "", "append to default system prompt (claude --append-system-prompt)")
+	effort := fs.String("effort", "", "effort level: low|medium|high|xhigh|max (claude --effort)")
+	permMode := fs.String("permission-mode", "", "permission mode: acceptEdits|auto|bypassPermissions|default|dontAsk|plan")
+	displayName := fs.String("display-name", "", "display name shown inside Claude's TUI (claude --name)")
+	sessionID := fs.String("session-id", "", "reuse a specific Claude session UUID")
+	resume := fs.String("resume", "", "resume a past conversation by session ID")
+	continueLast := fs.Bool("continue", false, "continue the most recent conversation in cwd")
+	agents := fs.String("agents", "", "JSON object defining custom agents (claude --agents)")
+
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -55,13 +82,44 @@ func cmdSpawn(args []string) error {
 	}
 	target := session + ":" + *winName
 
-	// Build the window command.
+	// Build the window command: first amux's args, then "--", then
+	// claude + every passthrough flag.
 	windowArgs := []string{"window", session, "-n", *winName, "--", claudeBin}
 	if !*noSkip {
 		windowArgs = append(windowArgs, "--dangerously-skip-permissions")
 	}
 	if *dir != "" {
 		windowArgs = append(windowArgs, "--add-dir", *dir)
+	}
+	if *model != "" {
+		windowArgs = append(windowArgs, "--model", *model)
+	}
+	if *systemPrompt != "" {
+		windowArgs = append(windowArgs, "--system-prompt", *systemPrompt)
+	}
+	if *appendSystem != "" {
+		windowArgs = append(windowArgs, "--append-system-prompt", *appendSystem)
+	}
+	if *effort != "" {
+		windowArgs = append(windowArgs, "--effort", *effort)
+	}
+	if *permMode != "" {
+		windowArgs = append(windowArgs, "--permission-mode", *permMode)
+	}
+	if *displayName != "" {
+		windowArgs = append(windowArgs, "--name", *displayName)
+	}
+	if *sessionID != "" {
+		windowArgs = append(windowArgs, "--session-id", *sessionID)
+	}
+	if *resume != "" {
+		windowArgs = append(windowArgs, "--resume", *resume)
+	}
+	if *continueLast {
+		windowArgs = append(windowArgs, "--continue")
+	}
+	if *agents != "" {
+		windowArgs = append(windowArgs, "--agents", *agents)
 	}
 	if _, err := runAmux(windowArgs...); err != nil {
 		return err
@@ -384,6 +442,279 @@ func cmdSlash(args []string) error {
 		if _, err := runAmux("key", target, "Enter"); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// --- plugin / auth / sessions (wrappers around claude subcommands) ---------
+
+// cmdPlugin wraps `claude plugin <subcmd>`. We don't reimplement any plugin
+// logic — we just streamline the invocation and forward flags/args.
+func cmdPlugin(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: camux plugin <list|install|uninstall|enable|disable|update|marketplace> [args...]")
+	}
+	claudeBin, err := findClaudeBin()
+	if err != nil {
+		return err
+	}
+	cmdArgs := append([]string{"plugin"}, args...)
+	cmd := exec.Command(claudeBin, cmdArgs...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// cmdAuth wraps `claude auth <subcmd>`. Auth itself may need interaction
+// (login flow) — we pass stdin/stdout/stderr through so the user can
+// complete the flow manually when needed.
+func cmdAuth(args []string) error {
+	claudeBin, err := findClaudeBin()
+	if err != nil {
+		return err
+	}
+	cmdArgs := append([]string{"auth"}, args...)
+	cmd := exec.Command(claudeBin, cmdArgs...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// cmdSessions enumerates amux sessions that look Claude-ish (a window's
+// command contains "claude" or the pane's Claude state is detectable).
+// Reports per-session pane target + state, so orchestrators can see
+// everything camux has spawned plus any hand-started Claudes.
+func cmdSessions(args []string) error {
+	fs := flag.NewFlagSet("sessions", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	asJSON := fs.Bool("json", false, "emit JSON")
+	allPanes := fs.Bool("all", false, "include non-Claude panes too")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	out, err := runAmux("list", "--json")
+	if err != nil {
+		return err
+	}
+	type paneInfo struct {
+		Session    string `json:"session"`
+		Window     int    `json:"window"`
+		WindowName string `json:"window_name"`
+		Pane       int    `json:"pane"`
+		PID        int    `json:"pid"`
+		Active     bool   `json:"active"`
+		Command    string `json:"command"`
+	}
+	var panes []paneInfo
+	if err := jsonUnmarshalOrEmpty([]byte(out), &panes); err != nil {
+		return fmt.Errorf("parse amux list json: %w", err)
+	}
+	type row struct {
+		Target  string      `json:"target"`
+		PID     int         `json:"pid"`
+		Command string      `json:"command"`
+		State   ClaudeState `json:"state"`
+	}
+	var rows []row
+	for _, p := range panes {
+		target := fmt.Sprintf("%s:%d.%d", p.Session, p.Window, p.Pane)
+		claudeish := isClaudeCommand(p.Command)
+		if !claudeish && !*allPanes {
+			continue
+		}
+		st := StateStarting
+		if claudeish {
+			if s, _, _ := currentState(target); s != "" {
+				st = s
+			}
+		} else {
+			st = ClaudeState("non-claude")
+		}
+		rows = append(rows, row{Target: target, PID: p.PID, Command: p.Command, State: st})
+	}
+	if *asJSON {
+		return jsonEncode(os.Stdout, rows)
+	}
+	if len(rows) == 0 {
+		fmt.Println("(no sessions)")
+		return nil
+	}
+	for _, r := range rows {
+		fmt.Printf("%-30s  pid=%-7d  state=%-18s  (%s)\n", r.Target, r.PID, r.State, r.Command)
+	}
+	return nil
+}
+
+func isClaudeCommand(cmd string) bool {
+	s := strings.ToLower(cmd)
+	// tmux shows the process's argv[0] which can be "claude", "node
+	// claude", a version string like "2.1.116", or a path. Best-effort.
+	if strings.Contains(s, "claude") {
+		return true
+	}
+	// Claude Code's command label often shows its version, e.g. "2.1.116".
+	if regexp.MustCompile(`^\d+\.\d+\.\d+`).MatchString(s) {
+		return true
+	}
+	return false
+}
+
+// cmdReload runs /reload-plugins inside the TUI to pick up plugin changes
+// without restarting Claude. Prints the TUI's summary line.
+func cmdReload(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: camux reload <target>")
+	}
+	target := args[0]
+	if !amuxExists(target) {
+		return fmt.Errorf("reload: no such target %s", target)
+	}
+	// Snapshot before so we can emit just the reload result line.
+	before, err := paneLineOffset(target)
+	if err != nil {
+		return err
+	}
+	if _, err := runAmux("type", target, "/reload-plugins", "--delay", "30ms"); err != nil {
+		return err
+	}
+	time.Sleep(250 * time.Millisecond)
+	if _, err := runAmux("key", target, "Enter"); err != nil {
+		return err
+	}
+	// Wait for the "Reloaded: ..." output line, with a short timeout.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		_, hs, _ := paneOffsetAndHistory(target)
+		rel := before - hs
+		out, _ := exec.Command("tmux", "capture-pane", "-p", "-t", target,
+			"-S", fmt.Sprint(rel)).Output()
+		if m := regexp.MustCompile(`Reloaded:.*`).FindString(string(out)); m != "" {
+			fmt.Println(m)
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("reload: didn't see reload confirmation in 10s")
+}
+
+// paneOffsetAndHistory returns (hs+cy, hs). Pulled here so cmdReload
+// doesn't need a tmux round-trip for just hs when paneLineOffset already
+// fetched them together.
+func paneOffsetAndHistory(target string) (int, int, error) {
+	out, err := exec.Command("tmux", "display-message", "-p", "-t", target,
+		"#{history_size} #{cursor_y}").Output()
+	if err != nil {
+		return 0, 0, err
+	}
+	var hs, cy int
+	fmt.Sscanf(strings.TrimSpace(string(out)), "%d %d", &hs, &cy)
+	return hs + cy, hs, nil
+}
+
+// cmdInfo runs /status in the TUI and parses the key fields. Prints
+// human-readable by default, --json for structured output. The session
+// ID (UUID) is one of the fields — useful for orchestrators that want
+// to resume sessions via `spawn --resume`.
+func cmdInfo(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: camux info <target> [--json]")
+	}
+	target := args[0]
+	fs := flag.NewFlagSet("info", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	asJSON := fs.Bool("json", false, "emit JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if !amuxExists(target) {
+		return fmt.Errorf("info: no such target %s", target)
+	}
+	// Snapshot before the slash so we can isolate /status output.
+	before, err := paneLineOffset(target)
+	if err != nil {
+		return err
+	}
+	if _, err := runAmux("type", target, "/status", "--delay", "30ms"); err != nil {
+		return err
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := runAmux("key", target, "Enter"); err != nil {
+		return err
+	}
+	// Poll capture until we see the Session ID line appear.
+	deadline := time.Now().Add(10 * time.Second)
+	var cap string
+	for time.Now().Before(deadline) {
+		_, hs, _ := paneOffsetAndHistory(target)
+		rel := before - hs
+		out, _ := exec.Command("tmux", "capture-pane", "-p", "-t", target,
+			"-S", fmt.Sprint(rel)).Output()
+		if strings.Contains(string(out), "Session ID:") {
+			cap = string(out)
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if cap == "" {
+		return fmt.Errorf("info: /status didn't produce a Session ID line in 10s")
+	}
+	// Dismiss the overlay (two Escapes is Claude's clear shortcut).
+	_, _ = runAmux("key", target, "Escape", "Escape")
+
+	// Parse fields out of the captured text.
+	info := parseStatusFields(cap)
+	info["target"] = target
+	if *asJSON {
+		return jsonEncode(os.Stdout, info)
+	}
+	for _, k := range []string{"version", "session_id", "session_name", "cwd", "login_method", "organization", "email", "model", "mcp_servers"} {
+		if v := info[k]; v != "" {
+			fmt.Printf("%-14s %s\n", k+":", v)
+		}
+	}
+	return nil
+}
+
+func parseStatusFields(s string) map[string]string {
+	out := map[string]string{}
+	scan := func(key, label string) {
+		// lines look like `  Session ID:       9270e246-…`
+		re := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(label) + `\s*(.+?)\s*$`)
+		if m := re.FindStringSubmatch(s); m != nil {
+			out[key] = strings.TrimSpace(m[1])
+		}
+	}
+	scan("version", "Version:")
+	scan("session_name", "Session name:")
+	scan("session_id", "Session ID:")
+	scan("cwd", "cwd:")
+	scan("login_method", "Login method:")
+	scan("organization", "Organization:")
+	scan("email", "Email:")
+	scan("model", "Model:")
+	scan("mcp_servers", "MCP servers:")
+	scan("setting_sources", "Setting sources:")
+	return out
+}
+
+// cmdModel switches the model in-session by typing /model <name>. We use
+// slash underneath so the TUI filter sees each keystroke.
+func cmdModel(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: camux model <target> <model>  (e.g. sonnet, opus, haiku-4-5)")
+	}
+	target, model := args[0], args[1]
+	if !amuxExists(target) {
+		return fmt.Errorf("model: no such target %s", target)
+	}
+	// Type "/model <name>" char-by-char, then Enter.
+	if _, err := runAmux("type", target, "/model "+model, "--delay", "60ms"); err != nil {
+		return err
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := runAmux("key", target, "Enter"); err != nil {
+		return err
 	}
 	return nil
 }

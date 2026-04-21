@@ -46,6 +46,30 @@ Commands:
          each keystroke) and press Enter to select. --no-enter leaves
          the cursor in the menu for follow-up navigation.
 
+  model <target> <model>
+         Switch model in-session via /model <name>. e.g. sonnet, opus,
+         haiku-4-5, or a full model ID.
+
+  plugin <subcmd> [args...]
+         Thin wrapper around 'claude plugin' — install, uninstall, list,
+         enable, disable, update, marketplace.
+
+  auth [status|login|logout]
+         Thin wrapper around 'claude auth'. Passes stdin/stdout through
+         so login can be completed interactively.
+
+  sessions [--json] [--all]
+         List all amux panes that look like Claude processes, with each
+         pane's state (ready/streaming/dialog/...). --all includes
+         non-Claude panes.
+
+Spawn flags (camux spawn <sess> --flag value):
+  --model M                  --system-prompt "..."   --append-system "..."
+  --effort LEVEL             --permission-mode MODE  --display-name "..."
+  --session-id UUID          --resume ID             --continue
+  --agents JSON              --add-dir PATH
+  --no-skip-perms            --timeout DUR
+
 camux delegates to the amux binary for all tmux-level operations. Set
 AMUX_BIN to override the amux executable name, CLAUDE_BIN to override the
 claude executable path.
@@ -83,6 +107,18 @@ func main() {
 		err = cmdClear(args)
 	case "slash":
 		err = cmdSlash(args)
+	case "plugin", "plugins":
+		err = cmdPlugin(args)
+	case "auth":
+		err = cmdAuth(args)
+	case "sessions", "ls":
+		err = cmdSessions(args)
+	case "model":
+		err = cmdModel(args)
+	case "reload":
+		err = cmdReload(args)
+	case "info":
+		err = cmdInfo(args)
 	default:
 		fmt.Fprintf(os.Stderr, "camux: unknown command %q\n\n", cmd)
 		fmt.Fprint(os.Stderr, usageText)

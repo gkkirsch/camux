@@ -23,16 +23,44 @@ Env vars:
 
 ## Commands
 
+### Lifecycle
 | Command | What it does |
 |---|---|
-| `spawn <session> [--name W] [--dir D] [--no-skip-perms]` | Launch Claude in a new session, dismiss the trust dialog if it appears, block until the TUI is truly ready. Prints `session:window` on stdout. |
-| `ask <target> [--timeout 180s] < prompt` | Refuse unless Ready. Paste + submit. Wait for streaming to stop. Emit the reply text (delta since submit). |
-| `status <target>` | Print state: `ready` / `streaming` / `trust-dialog` / `permission-dialog` / `starting` / `not-found` / `dead`. Exit 0 if ready, 1 if busy/dialog, 2 if not-found. |
-| `trust <target>` | If the trust dialog is up, confirm option 1. No-op otherwise. |
+| `spawn <session> [flags]` | Launch Claude in a new amux session, dismiss the trust dialog, block until truly ready. Prints `session:window`. Full flag list below. |
+| `ask <target> [--timeout 180s] < prompt` | Refuse unless Ready. Paste + submit. Wait for streaming to stop. Emit the reply delta. |
+| `status <target>` | Print state: `ready`/`streaming`/`trust-dialog`/`permission-dialog`/`starting`/`not-found`/`dead`. Exit 0/1/2. |
+| `sessions [--json] [--all]` | List all Claude-like panes across all amux sessions, each with pane target, PID, command, state. |
+| `info <target> [--json]` | Run `/status` in the TUI, parse version / session ID / cwd / login / organization / email / model / MCP status. |
+
+### Dialogs
+| Command | What it does |
+|---|---|
+| `trust <target>` | If trust dialog up, confirm option 1. No-op otherwise. |
 | `permit <target> [yes\|no\|always]` | Answer a tool-permission dialog. |
-| `interrupt <target>` | Send Escape — cancels a streaming reply. |
-| `clear <target>` | Double-Escape — clears the input buffer. |
-| `slash <target> <slashcmd> [--no-enter] [--delay 80ms]` | Type `/<cmd>` char-by-char and press Enter to select. `--no-enter` leaves you in the menu for follow-up nav. |
+
+### TUI control
+| Command | What it does |
+|---|---|
+| `interrupt <target>` | Single Escape — cancels streaming / dismisses overlay. |
+| `clear <target>` | Double-Escape — clears the input buffer (Claude's own shortcut). |
+| `slash <target> <slashcmd> [--no-enter] [--delay 80ms]` | Type `/<cmd>` char-by-char and Enter to select. |
+| `model <target> <model>` | Switch model in-session (shorthand for `/model <name>`). |
+| `reload <target>` | Run `/reload-plugins` and return the summary line. Apply plugin changes without restart. |
+
+### Plugins & auth (pass-throughs to `claude` subcommands)
+| Command | What it does |
+|---|---|
+| `plugin <list\|install\|uninstall\|enable\|disable\|update\|marketplace>` | Wraps `claude plugin …`. |
+| `auth [status\|login\|logout]` | Wraps `claude auth …`. Passes stdin/stdout through for interactive login. |
+
+### Spawn flags (claude passthroughs)
+```
+--model M                --system-prompt "…"        --append-system "…"
+--effort LEVEL           --permission-mode MODE     --display-name "…"
+--session-id UUID        --resume ID                --continue
+--agents JSON            --add-dir PATH
+--no-skip-perms          --timeout DUR              --name W
+```
 
 ## States
 
@@ -58,6 +86,61 @@ amux kill build-agent
 ```
 
 ## Recipes
+
+### Spawn with a custom system prompt, model, and effort
+
+```bash
+TARGET=$(camux spawn work \
+  --model sonnet \
+  --effort xhigh \
+  --append-system "Always prefix replies with RESEARCHER:")
+echo "what's the capital of france?" | camux ask $TARGET
+# → RESEARCHER: Paris
+```
+
+### Install a plugin WITHOUT exiting Claude
+
+```bash
+# Running Claude session is $TARGET. Normally you'd have to restart
+# after plugin changes — but /reload-plugins picks them up live.
+camux plugin marketplace update                 # refresh sources
+camux plugin install example-plugin             # headless install
+camux reload $TARGET                            # apply without restart
+#   → Reloaded: 2 plugins · 3 skills · …
+```
+
+### Resume a specific session by ID
+
+```bash
+# Grab the session UUID from /status
+SID=$(camux info work:cc --json | jq -r .session_id)
+amux kill work
+# Later — bring it back with the same conversation history
+camux spawn work --resume $SID
+```
+
+### Spawn a fleet with custom agents pre-defined
+
+```bash
+AGENTS='{
+  "researcher": {"description":"Finds facts","prompt":"You answer in bullet points."},
+  "critic":     {"description":"Critiques text","prompt":"Point out weaknesses."}
+}'
+for role in plan draft review; do
+  camux spawn $role --agents "$AGENTS" &
+done; wait
+```
+
+### See all running Claudes
+
+```bash
+camux sessions
+# df2:1.0   pid=95821   state=ready      (2.1.116)
+# mt:1.0    pid=96143   state=streaming  (2.1.116)
+camux sessions --json | jq '.[] | select(.state=="ready")'
+```
+
+## Full recipes
 
 ### Parallel fleet
 
@@ -103,6 +186,34 @@ amux log agent:cc /tmp/agent.transcript
 echo "task..." | camux ask agent:cc
 # /tmp/agent.transcript now has everything the pane displayed.
 ```
+
+## Gotchas specific to plugins / skills / marketplaces
+
+### Plugins installed outside a running Claude don't appear until reloaded
+
+Claude Code caches its plugin list at startup. `claude plugin install X`
+from the shell doesn't affect a running TUI until you either:
+
+1. Quit Claude (`camux clear + /exit` or kill the session) and respawn, OR
+2. Run `camux reload <target>` — `/reload-plugins` picks up the change
+   in-session. Much faster.
+
+### Marketplaces need explicit refresh
+
+`claude plugin marketplace update` refreshes the cached listing from each
+configured source. Do this **before** `camux plugin install X` if X is a
+new plugin not in your cache.
+
+```bash
+camux plugin marketplace update
+camux plugin install new-cool-thing
+camux reload $TARGET
+```
+
+### Skill discovery respects the same reload cycle
+
+A `.claude/skills/<name>.md` file you just wrote is NOT visible via `/help`
+in the running TUI until `camux reload <target>`. Same rule as plugins.
 
 ## Gotchas
 

@@ -100,6 +100,60 @@ func TestDetectStateReady(t *testing.T) {
 	}
 }
 
+func TestParseStatusFields(t *testing.T) {
+	s := `
+   Status   Config   Usage   Stats
+  Version:          2.1.116
+  Session name:     /rename to add a name
+  Session ID:       9270e246-660b-420e-8dce-5ce700d92b0d
+  cwd:              /Users/gkkirsch/dev/camux
+  Login method:     Claude Max account
+  Organization:     Garrett Kirschbaum
+  Email:            ibekidkirsch@gmail.com
+  Model:            Default Opus 4.7 with 1M context · Most capable
+  MCP servers:      2 connected, 3 need auth, 1 failed · /mcp
+  Setting sources:  User settings
+`
+	got := parseStatusFields(s)
+	want := map[string]string{
+		"version":         "2.1.116",
+		"session_id":      "9270e246-660b-420e-8dce-5ce700d92b0d",
+		"cwd":             "/Users/gkkirsch/dev/camux",
+		"login_method":    "Claude Max account",
+		"organization":    "Garrett Kirschbaum",
+		"email":           "ibekidkirsch@gmail.com",
+		"setting_sources": "User settings",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("parseStatusFields[%s] = %q, want %q", k, got[k], v)
+		}
+	}
+	if !strings.Contains(got["model"], "Opus 4.7") {
+		t.Errorf("parseStatusFields[model] = %q, want contains 'Opus 4.7'", got["model"])
+	}
+	if !strings.Contains(got["mcp_servers"], "2 connected") {
+		t.Errorf("parseStatusFields[mcp_servers] = %q, want contains '2 connected'", got["mcp_servers"])
+	}
+}
+
+func TestIsClaudeCommand(t *testing.T) {
+	cases := map[string]bool{
+		"claude":      true,
+		"node claude": true,
+		"2.1.116":     true,
+		"2.0.0":       true,
+		"bash":        false,
+		"zsh":         false,
+		"vim":         false,
+	}
+	for in, want := range cases {
+		if got := isClaudeCommand(in); got != want {
+			t.Errorf("isClaudeCommand(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
 func TestDetectStateStarting(t *testing.T) {
 	if got := detectState("random shell prompt"); got != StateStarting {
 		t.Fatalf("want starting (default), got %s", got)
