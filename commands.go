@@ -163,13 +163,15 @@ func cmdSpawn(args []string) error {
 
 func cmdAsk(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: camux ask <target> [--timeout 180s] [--interval 400ms] < prompt")
+		return fmt.Errorf("usage: camux ask <target> [--timeout 180s] [--interval 400ms] [--auto-permit MODE] [--auto-trust] < prompt")
 	}
 	target := args[0]
 	fs := flag.NewFlagSet("ask", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	timeout := fs.Duration("timeout", 180*time.Second, "overall timeout for the response")
 	interval := fs.Duration("interval", 400*time.Millisecond, "poll interval for state transitions")
+	autoPermit := fs.String("auto-permit", "", "auto-answer permission dialogs mid-response: yes|no|always (default: bail with error)")
+	autoTrust := fs.Bool("auto-trust", false, "auto-dismiss trust dialogs mid-response")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -243,10 +245,24 @@ func cmdAsk(args []string) error {
 		case StateReady:
 			return emitDelta(target, beforeOffset)
 		case StatePermission:
-			return fmt.Errorf("ask: paused on permission dialog on %s. Resolve with 'camux permit %s [yes|no]'.\nLast capture tail:\n%s",
+			if *autoPermit != "" {
+				if err := cmdPermit([]string{target, *autoPermit}); err != nil {
+					return fmt.Errorf("ask: auto-permit failed: %w", err)
+				}
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			return fmt.Errorf("ask: paused on permission dialog on %s. Re-run with --auto-permit yes, or resolve with 'camux permit %s [yes|no|always]' then use 'camux wait'.\nLast capture tail:\n%s",
 				target, target, lastLines(cap, 10))
 		case StateTrust:
-			return fmt.Errorf("ask: trust dialog appeared mid-ask on %s (unexpected). Resolve with 'camux trust %s'.", target, target)
+			if *autoTrust {
+				if err := cmdTrust([]string{target}); err != nil {
+					return fmt.Errorf("ask: auto-trust failed: %w", err)
+				}
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			return fmt.Errorf("ask: trust dialog appeared mid-ask on %s. Re-run with --auto-trust, or resolve with 'camux trust %s'.", target, target)
 		case StateNotFound, StateDead:
 			return fmt.Errorf("ask: target %s disappeared mid-response", target)
 		}
@@ -558,6 +574,65 @@ func isClaudeCommand(cmd string) bool {
 		return true
 	}
 	return false
+}
+
+// cmdWait blocks until the target is Ready, automatically resolving any
+// dialogs it passes through. Useful after an `ask` that bailed on a
+// permission dialog: answer it once, then `wait` until the task finishes.
+func cmdWait(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: camux wait <target> [--timeout 180s] [--auto-permit MODE] [--auto-trust]")
+	}
+	target := args[0]
+	fs := flag.NewFlagSet("wait", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	timeout := fs.Duration("timeout", 180*time.Second, "overall timeout")
+	interval := fs.Duration("interval", 400*time.Millisecond, "poll interval")
+	autoPermit := fs.String("auto-permit", "yes", "auto-answer permission dialogs: yes|no|always|off")
+	autoTrust := fs.Bool("auto-trust", true, "auto-dismiss trust dialogs")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if !amuxExists(target) {
+		return fmt.Errorf("wait: no such target %s", target)
+	}
+	deadline := time.Now().Add(*timeout)
+	for {
+		st, cap, err := currentState(target)
+		if err != nil {
+			return err
+		}
+		switch st {
+		case StateReady:
+			fmt.Println("ready")
+			return nil
+		case StatePermission:
+			if *autoPermit == "off" {
+				return fmt.Errorf("wait: permission dialog on %s and --auto-permit=off", target)
+			}
+			if err := cmdPermit([]string{target, *autoPermit}); err != nil {
+				return err
+			}
+			time.Sleep(400 * time.Millisecond)
+		case StateTrust:
+			if !*autoTrust {
+				return fmt.Errorf("wait: trust dialog on %s and --auto-trust=false", target)
+			}
+			if err := cmdTrust([]string{target}); err != nil {
+				return err
+			}
+			time.Sleep(400 * time.Millisecond)
+		case StateNotFound:
+			return fmt.Errorf("wait: target %s disappeared", target)
+		default:
+			// streaming / starting — just keep polling
+			_ = cap
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("wait: timed out after %s on %s (last state: %s)", *timeout, target, st)
+		}
+		time.Sleep(*interval)
+	}
 }
 
 // cmdReload runs /reload-plugins inside the TUI to pick up plugin changes

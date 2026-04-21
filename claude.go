@@ -24,8 +24,12 @@ const (
 // Patterns for state detection. All gleaned from observing Claude Code's
 // real TUI output. Order in detectState matters — more specific first.
 var (
-	reTrustDialog      = regexp.MustCompile(`(?i)Yes, I trust this folder|Quick safety check`)
-	rePermissionDialog = regexp.MustCompile(`(?i)Do you want to proceed\?|Allow this tool|permission required`)
+	reTrustDialog = regexp.MustCompile(`(?i)Yes, I trust this folder|Quick safety check`)
+	// Permission dialogs take many forms. The most reliable markers are
+	// variants of "Do you want to <verb>" and "Claude requested
+	// permissions". The "allow all edits during this session" option text
+	// is another unique signature that appears in most write/edit dialogs.
+	rePermissionDialog = regexp.MustCompile(`(?i)Do you want to\s|Claude requested permissions|allow all edits during this session`)
 	reStreamingStatus  = regexp.MustCompile(`esc to interrupt`)
 	reReadyPromptBar   = regexp.MustCompile(`⏵⏵ bypass permissions on|\? for shortcuts`)
 	reReadyPromptLine  = regexp.MustCompile(`(?m)^\s*❯\s*$`)

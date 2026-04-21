@@ -160,6 +160,24 @@ func TestDetectStateStarting(t *testing.T) {
 	}
 }
 
+// TestDetectStatePermissionDialogVariants covers the several phrasings
+// we've observed Claude using for tool-permission prompts. If Claude
+// adds a new variant, adding it here first reproduces the regression.
+func TestDetectStatePermissionDialogVariants(t *testing.T) {
+	cases := []string{
+		"Do you want to create demo.md?\n❯ 1. Yes\n 2. No",
+		"Do you want to proceed?\n❯ 1. Yes",
+		"Do you want to run Bash(rm -rf /)?\n❯ 1. Yes",
+		"Claude requested permissions to edit /foo which is a sensitive file.",
+		"❯ 1. Yes\n 2. Yes, allow all edits during this session (shift+tab)\n 3. No",
+	}
+	for i, c := range cases {
+		if got := detectState(c); got != StatePermission {
+			t.Errorf("case %d: want permission-dialog, got %s\n%s", i, got, c)
+		}
+	}
+}
+
 // --- status on a non-claude pane (should be starting, not ready) ----------
 
 func TestStatusNonClaude(t *testing.T) {

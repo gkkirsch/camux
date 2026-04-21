@@ -117,6 +117,8 @@ func main() {
 		err = cmdModel(args)
 	case "reload":
 		err = cmdReload(args)
+	case "wait":
+		err = cmdWait(args)
 	case "info":
 		err = cmdInfo(args)
 	default:
