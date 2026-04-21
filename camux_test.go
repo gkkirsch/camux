@@ -206,6 +206,52 @@ func TestStatusNotFound(t *testing.T) {
 	}
 }
 
+// TestWaitOnReadyShell: wait against a non-Claude pane that's already
+// settled. It will stay in "starting" state, so wait must time out —
+// that's the correct behavior (wait waits for Ready, not "any state").
+func TestWaitTimesOutOnNonClaude(t *testing.T) {
+	sess := fmt.Sprintf("camux-wait-%d", time.Now().UnixNano())
+	if out, err := exec.Command(amuxPath, "new", sess).CombinedOutput(); err != nil {
+		t.Fatalf("amux new: %v %s", err, out)
+	}
+	t.Cleanup(func() { killAmuxSession(sess) })
+
+	r := runCamux(t, "", "wait", sess+":0", "--timeout", "600ms", "--interval", "100ms")
+	if r.exit == 0 {
+		t.Fatalf("wait should not succeed on a non-claude pane (state=starting). stdout=%q", r.stdout)
+	}
+}
+
+// TestHelpPerCommand proves `camux <cmd> -h` prints the long help.
+func TestHelpPerCommand(t *testing.T) {
+	r := runCamux(t, "", "spawn", "-h")
+	if r.exit != 0 {
+		t.Fatalf("spawn -h should exit 0, got %d (%s)", r.exit, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "Launch Claude Code") {
+		t.Fatalf("spawn -h missing expected text:\n%s", r.stdout)
+	}
+	// Also test `camux help <cmd>`.
+	r = runCamux(t, "", "help", "ask")
+	if r.exit != 0 {
+		t.Fatalf("help ask should exit 0, got %d", r.exit)
+	}
+	if !strings.Contains(r.stdout, "Refuse unless") {
+		t.Fatalf("help ask missing expected text:\n%s", r.stdout)
+	}
+}
+
+// TestUnknownCommand proves unknown commands fail cleanly.
+func TestUnknownCommand(t *testing.T) {
+	r := runCamux(t, "", "flugelhorn")
+	if r.exit != 2 {
+		t.Fatalf("unknown command should exit 2, got %d", r.exit)
+	}
+	if !strings.Contains(r.stderr, "unknown command") {
+		t.Fatalf("expected 'unknown command' in stderr, got: %s", r.stderr)
+	}
+}
+
 // --- full e2e against real Claude (slow, gated) ---------------------------
 
 func TestSpawnAsk(t *testing.T) {
