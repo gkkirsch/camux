@@ -12,9 +12,10 @@ Usage:
 
 Commands:
   spawn  <session> [--name W] [--dir D] [--no-skip-perms]
-         Launch Claude Code in a new amux session, dismiss the trust dialog
-         if it appears, and block until the TUI is truly ready. Prints the
-         target (session:window) on success.
+         Launch Claude Code in a new amux session, auto-accept any
+         first-launch dialogs (trust, theme, login, bypass-perms),
+         and block until the TUI is truly ready. Prints the target
+         (session:window) on success.
 
   ask    <target> [--timeout 180s] < prompt
          Refuse unless the target is Ready. Submit the prompt via amux paste

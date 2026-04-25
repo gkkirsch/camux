@@ -144,6 +144,31 @@ func cmdSpawn(args []string) error {
 			}
 			// Give the TUI a beat to redraw before polling again.
 			time.Sleep(400 * time.Millisecond)
+		case StateTheme:
+			// Theme picker: option 1 = Auto. Accepting any theme is
+			// fine — the user can change later via /theme.
+			if err := chooseOption(target, "1"); err != nil {
+				return err
+			}
+			time.Sleep(500 * time.Millisecond)
+		case StateLogin:
+			// Login picker: option 1 = Claude account with subscription.
+			// The orch will already have valid OAuth via the keychain
+			// shim, so this should be a no-op transition past the dialog.
+			if err := chooseOption(target, "1"); err != nil {
+				return err
+			}
+			time.Sleep(500 * time.Millisecond)
+		case StateBypassPerms:
+			// Bypass-permissions consent: option 2 = "Yes, I accept".
+			// Option 1 is "No, exit" — the only menu where 1 is NOT
+			// the accepting choice. Spawn is invoked with
+			// --dangerously-skip-permissions on purpose, so accepting
+			// matches user intent.
+			if err := chooseOption(target, "2"); err != nil {
+				return err
+			}
+			time.Sleep(500 * time.Millisecond)
 		case StatePermission:
 			return fmt.Errorf("spawn: unexpected permission dialog before first use on %s — did Claude prompt for something?", target)
 		case StateNotFound:
@@ -157,6 +182,20 @@ func cmdSpawn(args []string) error {
 	_, cap, _ := currentState(target)
 	return fmt.Errorf("spawn: %s never reached ready state within %s. Last capture tail:\n%s",
 		target, *timeout, lastLines(cap, 15))
+}
+
+// chooseOption picks option N in a Claude TUI menu by typing the digit
+// and pressing Enter. Used by spawn to auto-handle first-launch dialogs
+// (theme, login, bypass-perms) and by the standalone `choose` command
+// for any menu the operator wants to drive from the CLI.
+func chooseOption(target, n string) error {
+	if _, err := runAmux("send", target, n); err != nil {
+		return fmt.Errorf("type option %q: %w", n, err)
+	}
+	if _, err := runAmux("key", target, "Enter"); err != nil {
+		return fmt.Errorf("press Enter after option %q: %w", n, err)
+	}
+	return nil
 }
 
 // --- ask --------------------------------------------------------------------

@@ -12,13 +12,16 @@ import (
 type ClaudeState string
 
 const (
-	StateReady      ClaudeState = "ready"
-	StateStreaming  ClaudeState = "streaming"
-	StateTrust      ClaudeState = "trust-dialog"
-	StatePermission ClaudeState = "permission-dialog"
-	StateStarting   ClaudeState = "starting"
-	StateNotFound   ClaudeState = "not-found"
-	StateDead       ClaudeState = "dead"
+	StateReady       ClaudeState = "ready"
+	StateStreaming   ClaudeState = "streaming"
+	StateTrust       ClaudeState = "trust-dialog"
+	StatePermission  ClaudeState = "permission-dialog"
+	StateTheme       ClaudeState = "theme-dialog"
+	StateLogin       ClaudeState = "login-dialog"
+	StateBypassPerms ClaudeState = "bypass-perms-dialog"
+	StateStarting    ClaudeState = "starting"
+	StateNotFound    ClaudeState = "not-found"
+	StateDead        ClaudeState = "dead"
 )
 
 // Patterns for state detection. All gleaned from observing Claude Code's
@@ -30,10 +33,18 @@ var (
 	// permissions". The "allow all edits during this session" option text
 	// is another unique signature that appears in most write/edit dialogs.
 	rePermissionDialog = regexp.MustCompile(`(?i)Do you want to\s|Claude requested permissions|allow all edits during this session`)
-	reStreamingStatus  = regexp.MustCompile(`esc to interrupt`)
-	reReadyPromptBar   = regexp.MustCompile(`⏵⏵ bypass permissions on|\? for shortcuts`)
-	reReadyPromptLine  = regexp.MustCompile(`(?m)^\s*❯\s*$`)
-	reWelcomeBanner    = regexp.MustCompile(`Claude Code v\d+`)
+	// First-launch dialogs (when CLAUDE_CONFIG_DIR is fresh and we
+	// haven't seeded onboarding state). roster's prepareClaudeIsolation
+	// normally skips all of these via .claude.json + settings.json
+	// seeding; these patterns are the safety net for direct-camux
+	// spawns or seeding edge cases.
+	reThemeDialog       = regexp.MustCompile(`Choose the text style|Dark mode \(colorblind`)
+	reLoginDialog       = regexp.MustCompile(`Select login method|Claude account with subscription`)
+	reBypassPermsDialog = regexp.MustCompile(`Bypass Permissions mode|Yes, I accept`)
+	reStreamingStatus   = regexp.MustCompile(`esc to interrupt`)
+	reReadyPromptBar    = regexp.MustCompile(`⏵⏵ bypass permissions on|\? for shortcuts`)
+	reReadyPromptLine   = regexp.MustCompile(`(?m)^\s*❯\s*$`)
+	reWelcomeBanner     = regexp.MustCompile(`Claude Code v\d+`)
 )
 
 // detectState classifies a capture of Claude's TUI. Order matters: dialogs
@@ -45,6 +56,15 @@ var (
 // fragile across tmux versions and column widths.
 func detectState(capture string) ClaudeState {
 	switch {
+	// First-launch dialogs are checked BEFORE the ready prompt bar:
+	// the ready bar can persist visually in capture buffers when a
+	// modal overlays the input area.
+	case reBypassPermsDialog.MatchString(capture):
+		return StateBypassPerms
+	case reLoginDialog.MatchString(capture):
+		return StateLogin
+	case reThemeDialog.MatchString(capture):
+		return StateTheme
 	case reTrustDialog.MatchString(capture):
 		return StateTrust
 	case rePermissionDialog.MatchString(capture):
