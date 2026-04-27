@@ -54,7 +54,16 @@ var (
 // Ready is the DEFAULT once we've ruled out dialogs and streaming and the
 // TUI status bar is visible — the empty-input-line regex turned out to be
 // fragile across tmux versions and column widths.
+//
+// Critical: "esc to interrupt" is a live status-bar indicator that only
+// appears at the very bottom of the screen while streaming. Old tool
+// outputs and "Interrupted" notes can leave that exact substring in
+// scrollback for hundreds of lines after the orch returned to idle. We
+// only look at the last few lines for the streaming + ready signals.
+// Dialogs scan the whole capture (they redraw every frame so a stale
+// match isn't possible).
 func detectState(capture string) ClaudeState {
+	tail := lastLines(capture, 8)
 	switch {
 	// First-launch dialogs are checked BEFORE the ready prompt bar:
 	// the ready bar can persist visually in capture buffers when a
@@ -69,9 +78,9 @@ func detectState(capture string) ClaudeState {
 		return StateTrust
 	case rePermissionDialog.MatchString(capture):
 		return StatePermission
-	case reStreamingStatus.MatchString(capture):
+	case reStreamingStatus.MatchString(tail):
 		return StateStreaming
-	case reReadyPromptBar.MatchString(capture):
+	case reReadyPromptBar.MatchString(tail):
 		return StateReady
 	case reWelcomeBanner.MatchString(capture):
 		return StateStarting
