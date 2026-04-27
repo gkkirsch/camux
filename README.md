@@ -1,6 +1,6 @@
 # camux
 
-Claude-Code-aware orchestration on top of [`amux`](../amux). Small Go CLI,
+Claude-Code-aware orchestration on top of [`amux`](https://github.com/gkkirsch/amux). Small Go CLI,
 shells out to `amux` for tmux primitives, adds:
 
 - State-machine-aware `ask`: refuses to submit unless Ready, waits for
@@ -21,7 +21,7 @@ amux kill demo
 ## Install
 
 ```bash
-git clone ... ~/dev/camux
+git clone https://github.com/gkkirsch/camux.git ~/dev/camux
 cd ~/dev/camux && make install
 ```
 
