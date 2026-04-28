@@ -165,11 +165,11 @@ func TestDetectStateStarting(t *testing.T) {
 // adds a new variant, adding it here first reproduces the regression.
 func TestDetectStatePermissionDialogVariants(t *testing.T) {
 	cases := []string{
-		"Do you want to create demo.md?\n❯ 1. Yes\n 2. No",
-		"Do you want to proceed?\n❯ 1. Yes",
-		"Do you want to run Bash(rm -rf /)?\n❯ 1. Yes",
-		"Claude requested permissions to edit /foo which is a sensitive file.",
-		"❯ 1. Yes\n 2. Yes, allow all edits during this session (shift+tab)\n 3. No",
+		"╭─\n│ Do you want to create demo.md?\n│ ❯ 1. Yes\n│   2. No\n╰─",
+		"╭─\n│ Do you want to proceed?\n│ ❯ 1. Yes\n╰─",
+		"╭─\n│ Do you want to run Bash(rm -rf /)?\n│ ❯ 1. Yes\n╰─",
+		"╭─\n│ Claude requested permissions to edit /foo which is a sensitive file.\n│ ❯ 1. Yes\n│   2. No\n╰─",
+		"╭─\n│ ❯ 1. Yes\n│   2. Yes, allow all edits during this session (shift+tab)\n│   3. No\n╰─",
 	}
 	for i, c := range cases {
 		if got := detectState(c); got != StatePermission {

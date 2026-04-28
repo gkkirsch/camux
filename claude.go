@@ -28,11 +28,22 @@ const (
 // real TUI output. Order in detectState matters — more specific first.
 var (
 	reTrustDialog = regexp.MustCompile(`(?i)Yes, I trust this folder|Quick safety check`)
-	// Permission dialogs take many forms. The most reliable markers are
-	// variants of "Do you want to <verb>" and "Claude requested
-	// permissions". The "allow all edits during this session" option text
-	// is another unique signature that appears in most write/edit dialogs.
-	rePermissionDialog = regexp.MustCompile(`(?i)Do you want to\s|Claude requested permissions|allow all edits during this session`)
+	// Permission dialogs take many forms. We detect them by combining
+	// two signals:
+	//   1. A trigger phrase ("Do you want to", "Claude requested
+	//      permissions", "allow all edits during this session").
+	//   2. A numbered-options block ("1. Yes", "2. No", …) — every
+	//      Claude Code permission modal renders one. Requiring both
+	//      avoids false positives when scrollback echoes the orch's
+	//      OWN text (e.g. an assistant message with "What do you want
+	//      to do?") that matches the trigger but isn't a live prompt.
+	rePermissionTrigger = regexp.MustCompile(`(?i)Do you want to\s|Claude requested permissions|allow all edits during this session`)
+	rePermissionOptions = regexp.MustCompile(`(?m)^[│|\s]*(?:❯\s*)?[1-5]\.\s+\S`)
+	// Modal dialogs in Claude Code's TUI are framed with box-drawing
+	// characters. Plain assistant replies that happen to contain "do
+	// you want to" + a numbered list do not. Requiring the box top OR
+	// bottom corner anchors detection to actual modals.
+	rePermissionFrame = regexp.MustCompile(`╭─|╰─|│ Do you want to`)
 	// First-launch dialogs (when CLAUDE_CONFIG_DIR is fresh and we
 	// haven't seeded onboarding state). roster's prepareClaudeIsolation
 	// normally skips all of these via .claude.json + settings.json
@@ -64,6 +75,11 @@ var (
 // match isn't possible).
 func detectState(capture string) ClaudeState {
 	tail := lastLines(capture, 8)
+	// Permission/trust dialogs overlay the input area at the bottom of
+	// the screen. Scoping their detection to a slightly larger window
+	// keeps a multi-line modal in view but prevents stale matches
+	// buried in scrollback from misclassifying the agent.
+	dialogTail := lastLines(capture, 20)
 	switch {
 	// First-launch dialogs are checked BEFORE the ready prompt bar:
 	// the ready bar can persist visually in capture buffers when a
@@ -74,9 +90,11 @@ func detectState(capture string) ClaudeState {
 		return StateLogin
 	case reThemeDialog.MatchString(capture):
 		return StateTheme
-	case reTrustDialog.MatchString(capture):
+	case reTrustDialog.MatchString(dialogTail):
 		return StateTrust
-	case rePermissionDialog.MatchString(capture):
+	case rePermissionTrigger.MatchString(dialogTail) &&
+		rePermissionOptions.MatchString(dialogTail) &&
+		rePermissionFrame.MatchString(dialogTail):
 		return StatePermission
 	case reStreamingStatus.MatchString(tail):
 		return StateStreaming
