@@ -39,11 +39,15 @@ var (
 	//      to do?") that matches the trigger but isn't a live prompt.
 	rePermissionTrigger = regexp.MustCompile(`(?i)Do you want to\s|Claude requested permissions|allow all edits during this session`)
 	rePermissionOptions = regexp.MustCompile(`(?m)^[│|\s]*(?:❯\s*)?[1-5]\.\s+\S`)
-	// Modal dialogs in Claude Code's TUI are framed with box-drawing
-	// characters. Plain assistant replies that happen to contain "do
-	// you want to" + a numbered list do not. Requiring the box top OR
-	// bottom corner anchors detection to actual modals.
-	rePermissionFrame = regexp.MustCompile(`╭─|╰─|│ Do you want to`)
+	// Anchors detection to a real live modal vs. plain assistant text.
+	// Two known framings:
+	//   1. Box-drawing modal:  ╭─/╰─/│  (the standard tool-use prompt)
+	//   2. Horizontal-rule + footer:  the "Claude requested permissions
+	//      to edit … which is a sensitive file" prompt has a thin
+	//      "Esc to cancel · Tab to amend" footer line and a horizontal
+	//      ─── divider above the message instead of a full box. Both
+	//      footer fragments are unique to live modals.
+	rePermissionFrame = regexp.MustCompile(`╭─|╰─|│ Do you want to|Esc to cancel.*Tab to amend|sensitive file`)
 	// First-launch dialogs (when CLAUDE_CONFIG_DIR is fresh and we
 	// haven't seeded onboarding state). roster's prepareClaudeIsolation
 	// normally skips all of these via .claude.json + settings.json
