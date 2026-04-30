@@ -49,7 +49,8 @@ func cmdSpawn(args []string) error {
 	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	winName := fs.String("name", "cc", "window name (e.g. 'cc', 'planner')")
-	dir := fs.String("dir", "", "launch cwd (becomes Claude's working directory)")
+	dir := fs.String("dir", "", "extra dir Claude is allowed to read (claude --add-dir)")
+	cwd := fs.String("cwd", "", "tmux window's working directory — Claude's $PWD")
 	noSkip := fs.Bool("no-skip-perms", false, "omit --dangerously-skip-permissions")
 	timeout := fs.Duration("timeout", 60*time.Second, "ready deadline")
 
@@ -84,7 +85,11 @@ func cmdSpawn(args []string) error {
 
 	// Build the window command: first amux's args, then "--", then
 	// claude + every passthrough flag.
-	windowArgs := []string{"window", session, "-n", *winName, "--", claudeBin}
+	windowArgs := []string{"window", session, "-n", *winName}
+	if *cwd != "" {
+		windowArgs = append(windowArgs, "-c", *cwd)
+	}
+	windowArgs = append(windowArgs, "--", claudeBin)
 	if !*noSkip {
 		windowArgs = append(windowArgs, "--dangerously-skip-permissions")
 	}
