@@ -193,6 +193,7 @@ flows work. Use 'auth status' non-interactively to check login state.`,
 }
 
 func main() {
+	resolveAmuxBin()
 	if v := os.Getenv("AMUX_BIN"); v != "" {
 		amuxBinName = v
 	}
