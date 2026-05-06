@@ -41,6 +41,26 @@ func findClaudeBin() (string, error) {
 
 // --- spawn ------------------------------------------------------------------
 
+// captureCmd runs a command and returns a single-line diagnostic
+// string of "exit=<n> out=<combined output, newlines→' | '>". Used
+// by spawn to embed multiple probe results in one error message.
+func captureCmd(name string, args ...string) string {
+	out, err := exec.Command(name, args...).CombinedOutput()
+	exitCode := 0
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			exitCode = ee.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+	s := strings.ReplaceAll(strings.TrimSpace(string(out)), "\n", " | ")
+	if s == "" {
+		s = "(empty)"
+	}
+	return fmt.Sprintf("exit=%d out=%q", exitCode, s)
+}
+
 func cmdSpawn(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: camux spawn <session> [flags] — see 'camux spawn -h'")
@@ -241,7 +261,24 @@ func cmdSpawn(args []string) error {
 		case StatePermission:
 			return fmt.Errorf("spawn: unexpected permission dialog before first use on %s — did Claude prompt for something?", target)
 		case StateNotFound:
-			return fmt.Errorf("spawn: window %s disappeared", target)
+			// We've seen this fire while the window genuinely is there
+			// (visible to amux/tmux from a separate shell) — meaning the
+			// false negative is in our own probe path, not in tmux.
+			// Dump everything we can see vs. what an external query
+			// sees, and include in the error so the next setup.log
+			// entry tells us where the divergence is. Three independent
+			// probes:
+			//   1. `amux exists target` (the path that returned false)
+			//   2. `tmux list-windows -t session` (what tmux reports)
+			//   3. `tmux display-message -p -t target ...` (direct query)
+			ax := captureCmd("amux", "exists", target)
+			lw := captureCmd("tmux", "list-windows", "-t", session)
+			dm := captureCmd("tmux", "display-message", "-p", "-t", target,
+				"sess=#{session_name} win=#{window_name} idx=#{window_index} dead=#{pane_dead} pid=#{pane_pid}")
+			tmuxEnv := os.Getenv("TMUX")
+			tmuxTmp := os.Getenv("TMUX_TMPDIR")
+			return fmt.Errorf("spawn: window %s reported disappeared by our probe, but the window may still exist. Diagnostic:\n  amux exists %s → %s\n  tmux list-windows -t %s → %s\n  tmux display-message -t %s → %s\n  TMUX=%q TMUX_TMPDIR=%q",
+				target, target, ax, session, lw, target, dm, tmuxEnv, tmuxTmp)
 		default:
 			// starting / streaming (unlikely on fresh spawn) — keep polling.
 		}
