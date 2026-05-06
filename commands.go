@@ -98,6 +98,18 @@ func cmdSpawn(args []string) error {
 	// stricter answer wins — better to refuse a legitimate retry than
 	// to keep stacking orphans.
 	if amuxExists(target) || tmuxWindowExists(session, *winName) {
+		// If the existing window is a dead pane (claude exited but
+		// remain-on-exit kept the buffer around), capture the buffer
+		// so the user sees WHY their previous attempt died, then kill
+		// the window so this attempt can proceed. Without this, the
+		// dup-window guard creates a permanent block: every retry
+		// sees the dead pane and refuses, the underlying init loop
+		// in director-app keeps spinning, and the user is stuck.
+		if paneIsDead(target) {
+			cap, _ := capture(target, 200)
+			_ = exec.Command("tmux", "kill-window", "-t", target).Run()
+			return fmt.Errorf("spawn: previous attempt at %s left a dead pane (claude exited before reaching ready). Cleaned up; the next retry should succeed. Last buffer:\n%s", target, lastLines(cap, 30))
+		}
 		return fmt.Errorf("spawn: window %s already exists — kill it (`amux kill-window %s` or `tmux kill-window -t %s`) or pick a different --name before retrying", target, target, target)
 	}
 
