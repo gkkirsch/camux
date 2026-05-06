@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"os/exec"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -112,16 +114,35 @@ func detectState(capture string) ClaudeState {
 }
 
 // currentState returns the live state of a Claude target, or NotFound if
-// the pane doesn't exist.
+// the pane doesn't exist. When spawn enables `remain-on-exit`, an exited
+// claude process leaves the pane in the "dead" state — we report
+// StateDead with the captured buffer so callers can include it in error
+// messages instead of losing it to tmux's reap.
 func currentState(target string) (ClaudeState, string, error) {
 	if !amuxExists(target) {
 		return StateNotFound, "", nil
+	}
+	if paneIsDead(target) {
+		cap, _ := capture(target, 200)
+		return StateDead, cap, nil
 	}
 	cap, err := capture(target, 200)
 	if err != nil {
 		return StateNotFound, "", err
 	}
 	return detectState(cap), cap, nil
+}
+
+// paneIsDead reports whether tmux has marked the pane as dead (the
+// process inside it exited but the pane is still around because
+// `remain-on-exit on` was set). Best-effort: if tmux doesn't respond,
+// treat it as alive and let the normal state machine continue.
+func paneIsDead(target string) bool {
+	out, err := exec.Command("tmux", "display-message", "-p", "-t", target, "#{pane_dead}").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "1"
 }
 
 // waitForState blocks until the target is in any of `want` states, or

@@ -141,11 +141,19 @@ func cmdSpawn(args []string) error {
 		return err
 	}
 
+	// Set remain-on-exit so the pane survives if claude exits before
+	// reaching ready. Without this, the pane is destroyed on exit and
+	// we lose claude's stderr (the only thing that would tell us why
+	// it died — auth failure, missing binary, bad arg, etc). Best-effort:
+	// if it fails, the StateNotFound branch below still produces a
+	// (less informative) error.
+	_ = exec.Command("tmux", "set-window-option", "-t", target, "remain-on-exit", "on").Run()
+
 	// Drive Claude to Ready state, handling the trust dialog if it appears.
 	deadline := time.Now().Add(*timeout)
 	attempts := 0
 	for time.Now().Before(deadline) {
-		st, _, err := currentState(target)
+		st, cap, err := currentState(target)
 		if err != nil {
 			return err
 		}
@@ -153,6 +161,12 @@ func cmdSpawn(args []string) error {
 		case StateReady:
 			fmt.Println(target)
 			return nil
+		case StateDead:
+			// claude exited before reaching ready. Pane buffer is
+			// preserved by the remain-on-exit option set above, so
+			// surface the last 30 lines — usually contains the
+			// actual error (auth, missing binary, invalid arg).
+			return fmt.Errorf("spawn: claude exited inside %s before reaching ready. Pane buffer:\n%s", target, lastLines(cap, 30))
 		case StateTrust:
 			// Default selection is "Yes, I trust this folder" — just press Enter.
 			if _, err := runAmux("key", target, "Enter"); err != nil {
