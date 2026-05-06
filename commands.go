@@ -83,6 +83,17 @@ func cmdSpawn(args []string) error {
 	}
 	target := session + ":" + *winName
 
+	// Refuse to stack duplicate windows. tmux happily allows multiple
+	// windows with the same name in one session, so without this check
+	// each retry of a failed spawn (e.g. director-app's setup poller
+	// retrying after a wait-for-ready timeout) silently adds another
+	// 'cc' window — first-launch failures pile up dozens of orphan
+	// claude TUIs in the same session. Make the second attempt fail
+	// loudly instead.
+	if amuxExists(target) {
+		return fmt.Errorf("spawn: window %s already exists — kill it (`amux kill-window %s`) or pick a different --name before retrying", target, target)
+	}
+
 	// Build the window command: first amux's args, then "--", then
 	// claude + every passthrough flag.
 	windowArgs := []string{"window", session, "-n", *winName}
