@@ -90,8 +90,15 @@ func cmdSpawn(args []string) error {
 	// 'cc' window — first-launch failures pile up dozens of orphan
 	// claude TUIs in the same session. Make the second attempt fail
 	// loudly instead.
-	if amuxExists(target) {
-		return fmt.Errorf("spawn: window %s already exists — kill it (`amux kill-window %s`) or pick a different --name before retrying", target, target)
+	//
+	// Belt-and-suspenders: we check both via amux AND via tmux directly.
+	// amuxExists has been observed in the wild to return false even when
+	// the window exists (different tmux server, .tmux.conf interference,
+	// stale PATH-resolved amux binary). When the wrappers disagree, the
+	// stricter answer wins — better to refuse a legitimate retry than
+	// to keep stacking orphans.
+	if amuxExists(target) || tmuxWindowExists(session, *winName) {
+		return fmt.Errorf("spawn: window %s already exists — kill it (`amux kill-window %s` or `tmux kill-window -t %s`) or pick a different --name before retrying", target, target, target)
 	}
 
 	// Build the window command: first amux's args, then "--", then

@@ -145,6 +145,28 @@ func paneIsDead(target string) bool {
 	return strings.TrimSpace(string(out)) == "1"
 }
 
+// tmuxWindowExists is a backstop check that bypasses amux entirely
+// and asks tmux directly whether the named window exists in the
+// session. We use this in cmdSpawn alongside amuxExists because
+// amux's wrapper has been observed to return false negatives in
+// some environments (different tmux server reachable to amux vs. the
+// one holding the window, stale PATH-resolved amux, .tmux.conf
+// hooks). False here means "either tmux says no, or tmux is broken
+// — the caller should still attempt to spawn." Match window NAME
+// exactly (no prefix matching) so this tracks amux's contract.
+func tmuxWindowExists(session, winName string) bool {
+	out, err := exec.Command("tmux", "list-windows", "-t", session, "-F", "#{window_name}").Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == winName {
+			return true
+		}
+	}
+	return false
+}
+
 // waitForState blocks until the target is in any of `want` states, or
 // times out. Between polls it sleeps `interval`. Useful building block
 // for spawn (wait for ready) and ask (wait for not-streaming).
