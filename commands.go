@@ -261,24 +261,30 @@ func cmdSpawn(args []string) error {
 		case StatePermission:
 			return fmt.Errorf("spawn: unexpected permission dialog before first use on %s — did Claude prompt for something?", target)
 		case StateNotFound:
-			// We've seen this fire while the window genuinely is there
-			// (visible to amux/tmux from a separate shell) — meaning the
-			// false negative is in our own probe path, not in tmux.
-			// Dump everything we can see vs. what an external query
-			// sees, and include in the error so the next setup.log
-			// entry tells us where the divergence is. Three independent
-			// probes:
-			//   1. `amux exists target` (the path that returned false)
-			//   2. `tmux list-windows -t session` (what tmux reports)
-			//   3. `tmux display-message -p -t target ...` (direct query)
+			// SELF-HEAL: our probe says the window's gone. Whether it
+			// genuinely is (claude crashed and tmux reaped the pane) or
+			// it's a probe false-negative (the same window is visible
+			// from a separate shell — we've seen this in the wild), the
+			// safest reaction is the same: best-effort kill anything
+			// matching the target so the next retry creates fresh state
+			// instead of co-opting a window we apparently can't see.
+			// Without this self-heal the spawn loop is stuck — orphan
+			// blocks future attempts AND the retry can't progress past
+			// it.
+			killOut := captureCmd("tmux", "kill-window", "-t", target)
+
+			// Diagnostic so we can eventually fix the root cause when
+			// the probe is the one lying. Three independent probes
+			// against the same tmux server, plus the env that decides
+			// which server we're talking to.
 			ax := captureCmd("amux", "exists", target)
 			lw := captureCmd("tmux", "list-windows", "-t", session)
 			dm := captureCmd("tmux", "display-message", "-p", "-t", target,
 				"sess=#{session_name} win=#{window_name} idx=#{window_index} dead=#{pane_dead} pid=#{pane_pid}")
 			tmuxEnv := os.Getenv("TMUX")
 			tmuxTmp := os.Getenv("TMUX_TMPDIR")
-			return fmt.Errorf("spawn: window %s reported disappeared by our probe, but the window may still exist. Diagnostic:\n  amux exists %s → %s\n  tmux list-windows -t %s → %s\n  tmux display-message -t %s → %s\n  TMUX=%q TMUX_TMPDIR=%q",
-				target, target, ax, session, lw, target, dm, tmuxEnv, tmuxTmp)
+			return fmt.Errorf("spawn: window %s reported disappeared; killed any leftover so the next retry can start fresh. Diagnostic:\n  tmux kill-window -t %s → %s\n  amux exists %s → %s\n  tmux list-windows -t %s → %s\n  tmux display-message -t %s → %s\n  TMUX=%q TMUX_TMPDIR=%q",
+				target, target, killOut, target, ax, session, lw, target, dm, tmuxEnv, tmuxTmp)
 		default:
 			// starting / streaming (unlikely on fresh spawn) — keep polling.
 		}
