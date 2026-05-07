@@ -76,7 +76,8 @@ func cmdSpawn(args []string) error {
 
 	// Passthrough flags mapped to `claude` CLI flags.
 	model := fs.String("model", "", "model alias or ID (claude --model)")
-	systemPrompt := fs.String("system-prompt", "", "full system prompt (claude --system-prompt)")
+	systemPrompt := fs.String("system-prompt", "", "full system prompt as a string (claude --system-prompt). Long prompts with shell metacharacters get mangled by tmux's default-shell parsing — prefer --system-prompt-file.")
+	systemPromptFile := fs.String("system-prompt-file", "", "path to a file containing the system prompt (claude --system-prompt-file). Avoids the shell-escaping pitfalls of passing the content inline.")
 	appendSystem := fs.String("append-system", "", "append to default system prompt (claude --append-system-prompt)")
 	effort := fs.String("effort", "", "effort level: low|medium|high|xhigh|max (claude --effort)")
 	permMode := fs.String("permission-mode", "", "permission mode: acceptEdits|auto|bypassPermissions|default|dontAsk|plan")
@@ -167,7 +168,9 @@ func cmdSpawn(args []string) error {
 	if *model != "" {
 		windowArgs = append(windowArgs, "--model", *model)
 	}
-	if *systemPrompt != "" {
+	if *systemPromptFile != "" {
+		windowArgs = append(windowArgs, "--system-prompt-file", *systemPromptFile)
+	} else if *systemPrompt != "" {
 		windowArgs = append(windowArgs, "--system-prompt", *systemPrompt)
 	}
 	if *appendSystem != "" {
