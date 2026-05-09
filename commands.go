@@ -104,52 +104,30 @@ func cmdSpawn(args []string) error {
 	}
 	target := session + ":" + *winName
 
-	// Refuse to stack duplicate windows. tmux happily allows multiple
-	// windows with the same name in one session, so without this check
-	// each retry of a failed spawn (e.g. director-app's setup poller
-	// retrying after a wait-for-ready timeout) silently adds another
-	// 'cc' window — first-launch failures pile up dozens of orphan
-	// claude TUIs in the same session. Make the second attempt fail
-	// loudly instead.
-	//
-	// Belt-and-suspenders: we check both via amux AND via tmux directly.
-	// amuxExists has been observed in the wild to return false even when
-	// the window exists (different tmux server, .tmux.conf interference,
-	// stale PATH-resolved amux binary). When the wrappers disagree, the
-	// stricter answer wins — better to refuse a legitimate retry than
-	// to keep stacking orphans.
 	// Decide whether to create a fresh window or co-opt an existing one.
 	// Three cases:
-	//   1. No existing window      → create + wait for ready (normal path).
-	//   2. Existing dead pane      → capture buffer, kill, error out so
-	//                                the next retry creates fresh (next
-	//                                spawn won't trip this branch).
-	//   3. Existing live window    → SKIP creation, fall through to the
-	//                                wait loop on the existing window.
-	//                                Covers the case where a prior spawn
-	//                                successfully created the window and
-	//                                claude reached ready but roster's
-	//                                registry write never happened (e.g.
-	//                                spawn process was killed mid-flight,
-	//                                or a transient false-negative in the
-	//                                wait loop made spawn exit with the
-	//                                window still alive). Without this,
-	//                                the live orphan permanently blocks
-	//                                every subsequent spawn — director-app
-	//                                retries, the dup-window guard refuses,
-	//                                the loop never breaks. Co-opting lets
-	//                                the wait loop see StateReady on the
-	//                                first iteration, print the target,
-	//                                and let roster persist the registry
-	//                                entry against the existing window.
+	//   1. No existing window  → create fresh, wait for ready.
+	//   2. Live existing window → co-opt it. Covers the case where a prior
+	//                             spawn created the window and claude reached
+	//                             ready but the caller didn't observe success
+	//                             (process killed mid-flight, transient probe
+	//                             false-negative). Without this the live
+	//                             orphan permanently blocks every retry.
+	//   3. Dead pane from a prior attempt → kill it and create fresh in this
+	//                             same call. If claude's still consistently
+	//                             crashing, the new attempt's StateDead error
+	//                             will surface the buffer; if it's transient,
+	//                             we recover transparently.
+	//
+	// Strict-match (amuxExists ∨ tmuxWindowExists) avoids stacking duplicate
+	// 'cc' windows when amux and tmux briefly disagree about visibility.
 	skipCreate := false
 	if amuxExists(target) || tmuxWindowExists(session, *winName) {
 		if paneIsDead(target) {
-			cap, _ := capture(target, 200)
 			_ = exec.Command("tmux", "kill-window", "-t", target).Run()
-			return fmt.Errorf("spawn: previous attempt at %s left a dead pane (claude exited before reaching ready). Cleaned up; the next retry should succeed. Last buffer:\n%s", target, lastLines(cap, 30))
+		} else {
+			skipCreate = true
 		}
-		skipCreate = true
 	}
 
 	// Build the window command: first amux's args, then "--", then
@@ -198,22 +176,81 @@ func cmdSpawn(args []string) error {
 		windowArgs = append(windowArgs, "--agents", *agents)
 	}
 	if !skipCreate {
-		if _, err := runAmux(windowArgs...); err != nil {
+		if err := createWindow(session, *winName, target, windowArgs); err != nil {
 			return err
 		}
-
-		// Set remain-on-exit so the pane survives if claude exits before
-		// reaching ready. Without this, the pane is destroyed on exit and
-		// we lose claude's stderr (the only thing that would tell us why
-		// it died — auth failure, missing binary, bad arg, etc). Best-effort:
-		// if it fails, the StateNotFound branch below still produces a
-		// (less informative) error.
-		_ = exec.Command("tmux", "set-window-option", "-t", target, "remain-on-exit", "on").Run()
 	}
+	return waitForReady(target, *timeout)
+}
 
-	// Drive Claude to Ready state, handling the trust dialog if it appears.
-	deadline := time.Now().Add(*timeout)
-	attempts := 0
+// createWindow opens the new amux window with `remain-on-exit` pinned
+// onto it, then waits until the window is visible to a strict probe.
+//
+// Why remain-on-exit is mandatory: when claude crashes faster than tmux
+// can default-handle it (auth bug, --resume to a missing session, bad
+// arg), `remain-on-exit on` keeps the dead pane around so the spawn
+// loop can read its buffer and report what happened. Without it, tmux
+// reaps the window and we'd surface "vanished" with no useful detail.
+//
+// Why post-create visibility check: amux returning success means tmux's
+// command server accepted new-window, but a follow-up tmux client
+// connection (the wait loop's first poll) can briefly observe the
+// pre-creation state. Polling for visibility here rather than once
+// inside the wait loop keeps the loop's contract simple — by the time
+// it runs, the window definitely exists.
+func createWindow(session, winName, target string, windowArgs []string) error {
+	var prev string
+	if out, err := exec.Command("tmux", "show-options", "-gv", "remain-on-exit").Output(); err == nil {
+		prev = strings.TrimSpace(string(out))
+	}
+	if err := exec.Command("tmux", "set-option", "-g", "remain-on-exit", "on").Run(); err != nil {
+		return fmt.Errorf("spawn: failed to enable tmux remain-on-exit before window creation: %w", err)
+	}
+	defer restoreRemainOnExit(prev)
+
+	if _, err := runAmux(windowArgs...); err != nil {
+		return err
+	}
+	if err := waitForWindowVisible(session, winName, target, 500*time.Millisecond); err != nil {
+		return err
+	}
+	if err := exec.Command("tmux", "set-window-option", "-t", target, "remain-on-exit", "on").Run(); err != nil {
+		return fmt.Errorf("spawn: window %s created but failed to pin remain-on-exit on it: %w", target, err)
+	}
+	return nil
+}
+
+func restoreRemainOnExit(prev string) {
+	if prev != "" {
+		_ = exec.Command("tmux", "set-option", "-g", "remain-on-exit", prev).Run()
+	} else {
+		_ = exec.Command("tmux", "set-option", "-gu", "remain-on-exit").Run()
+	}
+}
+
+func waitForWindowVisible(session, winName, target string, within time.Duration) error {
+	deadline := time.Now().Add(within)
+	for {
+		if amuxExists(target) || tmuxWindowExists(session, winName) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			lw := captureCmd("tmux", "list-windows", "-t", session, "-F",
+				"idx=#{window_index} name=#{window_name} dead=#{pane_dead}")
+			return fmt.Errorf("spawn: amux reported success creating %s but the window did not appear within %s. tmux list-windows -t %s → %s",
+				target, within, session, lw)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// waitForReady drives the Claude TUI from the moment its window exists to
+// the moment Claude is ready for input, dismissing first-launch dialogs
+// along the way. It does not own cleanup: a window that vanishes
+// mid-flight returns a transition error, not a self-heal kill — the
+// lifecycle layer (roster) decides what to do about orphan state.
+func waitForReady(target string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		st, cap, err := currentState(target)
 		if err != nil {
@@ -224,79 +261,39 @@ func cmdSpawn(args []string) error {
 			fmt.Println(target)
 			return nil
 		case StateDead:
-			// claude exited before reaching ready. Pane buffer is
-			// preserved by the remain-on-exit option set above, so
-			// surface the last 30 lines — usually contains the
-			// actual error (auth, missing binary, invalid arg).
 			return fmt.Errorf("spawn: claude exited inside %s before reaching ready. Pane buffer:\n%s", target, lastLines(cap, 30))
+		case StateNotFound:
+			return fmt.Errorf("spawn: window %s vanished after creation. claude likely crashed faster than tmux could honor remain-on-exit", target)
 		case StateTrust:
-			// Default selection is "Yes, I trust this folder" — just press Enter.
 			if _, err := runAmux("key", target, "Enter"); err != nil {
 				return err
 			}
-			// Give the TUI a beat to redraw before polling again.
 			time.Sleep(400 * time.Millisecond)
 		case StateTheme:
-			// Theme picker: option 1 = Auto. Accepting any theme is
-			// fine — the user can change later via /theme.
 			if err := chooseOption(target, "1"); err != nil {
 				return err
 			}
 			time.Sleep(500 * time.Millisecond)
 		case StateLogin:
-			// Login picker: option 1 = Claude account with subscription.
-			// The orch will already have valid OAuth via the keychain
-			// shim, so this should be a no-op transition past the dialog.
 			if err := chooseOption(target, "1"); err != nil {
 				return err
 			}
 			time.Sleep(500 * time.Millisecond)
 		case StateBypassPerms:
-			// Bypass-permissions consent: option 2 = "Yes, I accept".
-			// Option 1 is "No, exit" — the only menu where 1 is NOT
-			// the accepting choice. Spawn is invoked with
-			// --dangerously-skip-permissions on purpose, so accepting
-			// matches user intent.
+			// Option 2 = "Yes, I accept". Option 1 = "No, exit" — the only
+			// menu where 1 is not the accepting choice.
 			if err := chooseOption(target, "2"); err != nil {
 				return err
 			}
 			time.Sleep(500 * time.Millisecond)
 		case StatePermission:
-			return fmt.Errorf("spawn: unexpected permission dialog before first use on %s — did Claude prompt for something?", target)
-		case StateNotFound:
-			// SELF-HEAL: our probe says the window's gone. Whether it
-			// genuinely is (claude crashed and tmux reaped the pane) or
-			// it's a probe false-negative (the same window is visible
-			// from a separate shell — we've seen this in the wild), the
-			// safest reaction is the same: best-effort kill anything
-			// matching the target so the next retry creates fresh state
-			// instead of co-opting a window we apparently can't see.
-			// Without this self-heal the spawn loop is stuck — orphan
-			// blocks future attempts AND the retry can't progress past
-			// it.
-			killOut := captureCmd("tmux", "kill-window", "-t", target)
-
-			// Diagnostic so we can eventually fix the root cause when
-			// the probe is the one lying. Three independent probes
-			// against the same tmux server, plus the env that decides
-			// which server we're talking to.
-			ax := captureCmd("amux", "exists", target)
-			lw := captureCmd("tmux", "list-windows", "-t", session)
-			dm := captureCmd("tmux", "display-message", "-p", "-t", target,
-				"sess=#{session_name} win=#{window_name} idx=#{window_index} dead=#{pane_dead} pid=#{pane_pid}")
-			tmuxEnv := os.Getenv("TMUX")
-			tmuxTmp := os.Getenv("TMUX_TMPDIR")
-			return fmt.Errorf("spawn: window %s reported disappeared; killed any leftover so the next retry can start fresh. Diagnostic:\n  tmux kill-window -t %s → %s\n  amux exists %s → %s\n  tmux list-windows -t %s → %s\n  tmux display-message -t %s → %s\n  TMUX=%q TMUX_TMPDIR=%q",
-				target, target, killOut, target, ax, session, lw, target, dm, tmuxEnv, tmuxTmp)
-		default:
-			// starting / streaming (unlikely on fresh spawn) — keep polling.
+			return fmt.Errorf("spawn: unexpected permission dialog before first use on %s", target)
 		}
 		time.Sleep(300 * time.Millisecond)
-		attempts++
 	}
 	_, cap, _ := currentState(target)
 	return fmt.Errorf("spawn: %s never reached ready state within %s. Last capture tail:\n%s",
-		target, *timeout, lastLines(cap, 15))
+		target, timeout, lastLines(cap, 15))
 }
 
 // chooseOption picks option N in a Claude TUI menu by typing the digit

@@ -114,23 +114,50 @@ func detectState(capture string) ClaudeState {
 }
 
 // currentState returns the live state of a Claude target, or NotFound if
-// the pane doesn't exist. When spawn enables `remain-on-exit`, an exited
+// the window doesn't exist. When spawn enables `remain-on-exit`, an exited
 // claude process leaves the pane in the "dead" state — we report
 // StateDead with the captured buffer so callers can include it in error
 // messages instead of losing it to tmux's reap.
+//
+// Strictness: tmux's `-t session:name` resolution is fuzzy and falls back
+// to the active window when `name` doesn't exist. We verify the returned
+// window matches what we asked for (by name OR index, whichever the
+// caller used) so a missing target reads as NotFound instead of resolving
+// to whatever else tmux had on hand.
+//
+// Race tolerance: if the window vanishes between display-message and
+// capture-pane (a normal occurrence when something is killing windows
+// concurrently), we report NotFound rather than leaking tmux's stderr.
 func currentState(target string) (ClaudeState, string, error) {
-	if !amuxExists(target) {
+	_, want := splitTarget(target)
+	out, err := exec.Command("tmux", "display-message", "-p", "-t", target,
+		"#{window_name}\t#{window_index}\t#{pane_dead}").Output()
+	if err != nil {
 		return StateNotFound, "", nil
 	}
-	if paneIsDead(target) {
-		cap, _ := capture(target, 200)
-		return StateDead, cap, nil
+	parts := strings.SplitN(strings.TrimSpace(string(out)), "\t", 3)
+	if len(parts) != 3 || (parts[0] != want && parts[1] != want) {
+		return StateNotFound, "", nil
 	}
-	cap, err := capture(target, 200)
+	dead := parts[2] == "1"
+	cap, err := exec.Command("tmux", "capture-pane", "-p", "-t", target, "-S", "-200").Output()
 	if err != nil {
-		return StateNotFound, "", err
+		return StateNotFound, "", nil
 	}
-	return detectState(cap), cap, nil
+	if dead {
+		return StateDead, string(cap), nil
+	}
+	return detectState(string(cap)), string(cap), nil
+}
+
+// splitTarget splits a "session:window" target. Returns ("", "") if there's
+// no colon — callers treat that as a session-only target.
+func splitTarget(target string) (sess, win string) {
+	i := strings.Index(target, ":")
+	if i < 0 {
+		return target, ""
+	}
+	return target[:i], target[i+1:]
 }
 
 // paneIsDead reports whether tmux has marked the pane as dead (the
