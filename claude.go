@@ -130,18 +130,51 @@ func detectState(capture string) ClaudeState {
 // concurrently), we report NotFound rather than leaking tmux's stderr.
 func currentState(target string) (ClaudeState, string, error) {
 	_, want := splitTarget(target)
-	out, err := exec.Command("tmux", "display-message", "-p", "-t", target,
-		"#{window_name}\t#{window_index}\t#{pane_dead}").Output()
+	cmd := exec.Command("tmux", "display-message", "-p", "-t", target,
+		"#{window_name}\t#{window_index}\t#{pane_dead}")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
+		traceLog("currentState.display-message.error",
+			"target", target, "want", want,
+			"err", err.Error(),
+			"out", strings.TrimSpace(string(out)))
 		return StateNotFound, "", nil
 	}
-	parts := strings.SplitN(strings.TrimSpace(string(out)), "\t", 3)
-	if len(parts) != 3 || (parts[0] != want && parts[1] != want) {
+	raw := strings.TrimSpace(string(out))
+	parts := strings.SplitN(raw, "\t", 3)
+	if len(parts) != 3 {
+		traceLog("currentState.parse.short",
+			"target", target, "want", want,
+			"raw", raw, "len", fmt.Sprint(len(parts)))
+		return StateNotFound, "", nil
+	}
+	if parts[0] != want && parts[1] != want {
+		// tmux's display-message falls back to the active window when the
+		// requested target name doesn't exist yet — and returns exit 0
+		// with the fallback window's data. Strict-match correctly rejects
+		// it, but the fallback fires during the post-new-window race
+		// before display-message's resolver has seen the new window
+		// (which list-windows ALREADY sees, because that's a different
+		// code path that updates synchronously). Rather than declare
+		// NotFound and tear everything down, double-check with
+		// list-windows: if it sees our window, keep polling.
+		sess, _ := splitTarget(target)
+		if tmuxWindowExists(sess, want) {
+			traceLog("currentState.race-fallback",
+				"target", target, "want", want,
+				"displayMessageName", parts[0], "displayMessageIdx", parts[1],
+				"listWindowsSays", "present")
+			return StateStarting, "", nil
+		}
+		traceLog("currentState.mismatch",
+			"target", target, "want", want,
+			"name", parts[0], "idx", parts[1], "dead", parts[2])
 		return StateNotFound, "", nil
 	}
 	dead := parts[2] == "1"
 	cap, err := exec.Command("tmux", "capture-pane", "-p", "-t", target, "-S", "-200").Output()
 	if err != nil {
+		traceLog("currentState.capture-pane.error", "target", target, "err", err.Error())
 		return StateNotFound, "", nil
 	}
 	if dead {

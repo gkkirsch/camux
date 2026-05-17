@@ -96,11 +96,24 @@ func cmdSpawn(args []string) error {
 		return err
 	}
 
+	traceLog("spawn.enter",
+		"session", session,
+		"winName", *winName,
+		"claudeBin", claudeBin,
+		"cwd", *cwd,
+		"model", *model,
+		"systemPromptFile", *systemPromptFile,
+		"timeout", timeout.String())
+
 	// Create the session if it doesn't already exist.
-	if !amuxExists(session) {
+	sessionExisted := amuxExists(session)
+	traceLog("spawn.session-check", "session", session, "existed", fmt.Sprint(sessionExisted))
+	if !sessionExisted {
 		if _, err := runAmux("new", session); err != nil {
+			traceLog("spawn.session-new.error", "session", session, "err", err.Error())
 			return err
 		}
+		snapshotTmux("spawn.after-new", session)
 	}
 	target := session + ":" + *winName
 
@@ -122,13 +135,23 @@ func cmdSpawn(args []string) error {
 	// Strict-match (amuxExists ∨ tmuxWindowExists) avoids stacking duplicate
 	// 'cc' windows when amux and tmux briefly disagree about visibility.
 	skipCreate := false
-	if amuxExists(target) || tmuxWindowExists(session, *winName) {
-		if paneIsDead(target) {
+	amuxSeesTarget := amuxExists(target)
+	tmuxSeesWindow := tmuxWindowExists(session, *winName)
+	targetIsDead := false
+	if amuxSeesTarget || tmuxSeesWindow {
+		targetIsDead = paneIsDead(target)
+		if targetIsDead {
 			_ = exec.Command("tmux", "kill-window", "-t", target).Run()
 		} else {
 			skipCreate = true
 		}
 	}
+	traceLog("spawn.target-check",
+		"target", target,
+		"amuxExists", fmt.Sprint(amuxSeesTarget),
+		"tmuxWindowExists", fmt.Sprint(tmuxSeesWindow),
+		"paneDead", fmt.Sprint(targetIsDead),
+		"skipCreate", fmt.Sprint(skipCreate))
 
 	// Build the window command: first amux's args, then "--", then
 	// claude + every passthrough flag.
@@ -199,24 +222,39 @@ func cmdSpawn(args []string) error {
 // inside the wait loop keeps the loop's contract simple — by the time
 // it runs, the window definitely exists.
 func createWindow(session, winName, target string, windowArgs []string) error {
+	traceLog("createWindow.enter", "session", session, "winName", winName, "target", target, "windowArgs", strings.Join(windowArgs, " "))
 	var prev string
 	if out, err := exec.Command("tmux", "show-options", "-gv", "remain-on-exit").Output(); err == nil {
 		prev = strings.TrimSpace(string(out))
 	}
+	traceLog("createWindow.remain-on-exit.before", "global", prev)
 	if err := exec.Command("tmux", "set-option", "-g", "remain-on-exit", "on").Run(); err != nil {
+		traceLog("createWindow.remain-on-exit.set.error", "err", err.Error())
 		return fmt.Errorf("spawn: failed to enable tmux remain-on-exit before window creation: %w", err)
 	}
 	defer restoreRemainOnExit(prev)
 
 	if _, err := runAmux(windowArgs...); err != nil {
+		traceLog("createWindow.amux.error", "err", err.Error())
 		return err
 	}
+	traceLog("createWindow.amux.ok")
+	snapshotTmux("createWindow.after-amux", session)
+	snapshotWindow("createWindow.after-amux", target)
+
 	if err := waitForWindowVisible(session, winName, target, 500*time.Millisecond); err != nil {
+		traceLog("createWindow.waitForVisible.error", "err", err.Error())
+		snapshotTmux("createWindow.waitForVisible.fail", session)
 		return err
 	}
+	traceLog("createWindow.waitForVisible.ok")
+	snapshotWindow("createWindow.waitForVisible.ok", target)
+
 	if err := exec.Command("tmux", "set-window-option", "-t", target, "remain-on-exit", "on").Run(); err != nil {
+		traceLog("createWindow.pin-remain-on-exit.error", "err", err.Error())
 		return fmt.Errorf("spawn: window %s created but failed to pin remain-on-exit on it: %w", target, err)
 	}
+	traceLog("createWindow.done")
 	return nil
 }
 
@@ -250,20 +288,61 @@ func waitForWindowVisible(session, winName, target string, within time.Duration)
 // mid-flight returns a transition error, not a self-heal kill — the
 // lifecycle layer (roster) decides what to do about orphan state.
 func waitForReady(target string, timeout time.Duration) error {
+	sess, _ := splitTarget(target)
+	traceLog("waitForReady.enter", "target", target, "timeout", timeout.String())
+	snapshotTmux("waitForReady.enter", sess)
+	snapshotWindow("waitForReady.enter", target)
+
 	deadline := time.Now().Add(timeout)
+	// StateNotFound can be reported transiently right after window creation:
+	// `amux new-window` returns before tmux's internal window list reflects
+	// the new entry, so the first poll can miss a window that's actually
+	// fine. Tolerate up to ~500ms of consecutive NotFound before declaring
+	// "vanished". A truly missing window will still fail (the counter never
+	// resets), just half a second later.
+	const notFoundTolerance = 5
+	notFoundStreak := 0
+	poll := 0
+	var prevState ClaudeState = "<none>"
 	for time.Now().Before(deadline) {
+		poll++
 		st, cap, err := currentState(target)
+		if st != prevState {
+			traceLog("waitForReady.transition",
+				"target", target,
+				"poll", fmt.Sprint(poll),
+				"from", string(prevState),
+				"to", string(st),
+				"captureLen", fmt.Sprint(len(cap)),
+				"err", errString(err))
+			prevState = st
+		}
 		if err != nil {
 			return err
 		}
+		if st != StateNotFound {
+			notFoundStreak = 0
+		}
 		switch st {
 		case StateReady:
+			traceLog("waitForReady.ready", "target", target, "poll", fmt.Sprint(poll))
 			fmt.Println(target)
 			return nil
 		case StateDead:
+			traceLog("waitForReady.dead", "target", target, "poll", fmt.Sprint(poll), "tail", lastLines(cap, 30))
 			return fmt.Errorf("spawn: claude exited inside %s before reaching ready. Pane buffer:\n%s", target, lastLines(cap, 30))
 		case StateNotFound:
-			return fmt.Errorf("spawn: window %s vanished after creation. claude likely crashed faster than tmux could honor remain-on-exit", target)
+			notFoundStreak++
+			traceLog("waitForReady.notfound", "target", target, "poll", fmt.Sprint(poll), "streak", fmt.Sprint(notFoundStreak))
+			// Every NotFound, snapshot tmux state so we can compare what
+			// list-windows says vs what display-message says.
+			snapshotTmux("waitForReady.notfound", sess)
+			snapshotWindow("waitForReady.notfound", target)
+			if notFoundStreak >= notFoundTolerance {
+				snapshotTmux("waitForReady.notfound.fail", sess)
+				return fmt.Errorf("spawn: window %s vanished after creation (NotFound for %d consecutive polls, ~%dms). claude likely crashed faster than tmux could honor remain-on-exit", target, notFoundStreak, notFoundStreak*100)
+			}
+			time.Sleep(100 * time.Millisecond)
 		case StateTrust:
 			if _, err := runAmux("key", target, "Enter"); err != nil {
 				return err
