@@ -129,49 +129,57 @@ func detectState(capture string) ClaudeState {
 // capture-pane (a normal occurrence when something is killing windows
 // concurrently), we report NotFound rather than leaking tmux's stderr.
 func currentState(target string) (ClaudeState, string, error) {
-	_, want := splitTarget(target)
-	cmd := exec.Command("tmux", "display-message", "-p", "-t", target,
-		"#{window_name}\t#{window_index}\t#{pane_dead}")
-	out, err := cmd.CombinedOutput()
+	sess, want := splitTarget(target)
+	// Use list-windows (one row per window, exact-match safe, locale-
+	// independent) instead of display-message with tab-separated format.
+	// display-message has TWO failure modes that have bitten us:
+	//
+	//  1. Fuzzy fallback: when the target name doesn't exist (yet), tmux
+	//     resolves session:name to whatever window IS active and returns
+	//     exit 0. The strict parts[0]==want check correctly rejected the
+	//     fallback, but during the post-new-window race the cc window was
+	//     newly-created but not yet findable by name → fired StateNotFound
+	//     during the spawn → "vanished after creation" while the window
+	//     was sitting there happily. (Fixed in v0.3.10 by re-probing with
+	//     list-windows on mismatch; that workaround is now unnecessary
+	//     because we use list-windows directly.)
+	//
+	//  2. Tab gets replaced with `_` (0x5f) in tmux's display-message
+	//     format output when LANG is unset or non-UTF-8. Director.app
+	//     launches subprocesses with a minimal env (PATH + HOME only),
+	//     so tmux defaults to C locale and mangles the TAB. Our parse
+	//     then sees "cc_1_0" as one part and returns NotFound — every
+	//     poll, deterministically, regardless of fix #1. list-windows
+	//     uses NEWLINE as row separator (always safe) and lets us pick
+	//     a literal `|` field separator (always preserved verbatim).
+	out, err := exec.Command("tmux", "list-windows", "-t", sess,
+		"-F", "#{window_name}|#{window_index}|#{pane_dead}").CombinedOutput()
 	if err != nil {
-		traceLog("currentState.display-message.error",
-			"target", target, "want", want,
+		traceLog("currentState.list-windows.error",
+			"target", target, "sess", sess, "want", want,
 			"err", err.Error(),
 			"out", strings.TrimSpace(string(out)))
 		return StateNotFound, "", nil
 	}
-	raw := strings.TrimSpace(string(out))
-	parts := strings.SplitN(raw, "\t", 3)
-	if len(parts) != 3 {
-		traceLog("currentState.parse.short",
-			"target", target, "want", want,
-			"raw", raw, "len", fmt.Sprint(len(parts)))
-		return StateNotFound, "", nil
-	}
-	if parts[0] != want && parts[1] != want {
-		// tmux's display-message falls back to the active window when the
-		// requested target name doesn't exist yet — and returns exit 0
-		// with the fallback window's data. Strict-match correctly rejects
-		// it, but the fallback fires during the post-new-window race
-		// before display-message's resolver has seen the new window
-		// (which list-windows ALREADY sees, because that's a different
-		// code path that updates synchronously). Rather than declare
-		// NotFound and tear everything down, double-check with
-		// list-windows: if it sees our window, keep polling.
-		sess, _ := splitTarget(target)
-		if tmuxWindowExists(sess, want) {
-			traceLog("currentState.race-fallback",
-				"target", target, "want", want,
-				"displayMessageName", parts[0], "displayMessageIdx", parts[1],
-				"listWindowsSays", "present")
-			return StateStarting, "", nil
+	found := false
+	dead := false
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.SplitN(line, "|", 3)
+		if len(parts) != 3 {
+			continue
 		}
-		traceLog("currentState.mismatch",
-			"target", target, "want", want,
-			"name", parts[0], "idx", parts[1], "dead", parts[2])
+		if parts[0] == want || parts[1] == want {
+			found = true
+			dead = parts[2] == "1"
+			break
+		}
+	}
+	if !found {
+		traceLog("currentState.list-windows.no-match",
+			"target", target, "sess", sess, "want", want,
+			"rows", strings.ReplaceAll(strings.TrimSpace(string(out)), "\n", " | "))
 		return StateNotFound, "", nil
 	}
-	dead := parts[2] == "1"
 	cap, err := exec.Command("tmux", "capture-pane", "-p", "-t", target, "-S", "-200").Output()
 	if err != nil {
 		traceLog("currentState.capture-pane.error", "target", target, "err", err.Error())
